@@ -1,104 +1,126 @@
-package socks
+package proxy
 
 import (
 	"io"
 	"net"
+	"strconv"
 	"sync"
+	"time"
 
-	"golang.org/x/net/proxy"
+	"github.com/xjasonlyu/tun2socks/common/lsof"
+	"github.com/xjasonlyu/tun2socks/common/pool"
+	"github.com/xjasonlyu/tun2socks/core"
+	"github.com/xjasonlyu/tun2socks/log"
 
-	"github.com/eycorsican/go-tun2socks/common/log"
-	"github.com/eycorsican/go-tun2socks/core"
+	S "github.com/xjasonlyu/tun2socks/component/session"
 )
 
 type tcpHandler struct {
-	sync.Mutex
-
 	proxyHost string
-	proxyPort uint16
+	proxyPort int
 }
 
-func NewTCPHandler(proxyHost string, proxyPort uint16) core.TCPConnHandler {
+func NewTCPHandler(proxyHost string, proxyPort int) core.TCPConnHandler {
 	return &tcpHandler{
 		proxyHost: proxyHost,
 		proxyPort: proxyPort,
 	}
 }
 
-type direction byte
-
-const (
-	dirUplink direction = iota
-	dirDownlink
-)
-
-type duplexConn interface {
-	net.Conn
-	CloseRead() error
-	CloseWrite() error
-}
-
-func (h *tcpHandler) relay(lhs, rhs net.Conn) {
-	upCh := make(chan struct{})
-
-	cls := func(dir direction, interrupt bool) {
-		lhsDConn, lhsOk := lhs.(duplexConn)
-		rhsDConn, rhsOk := rhs.(duplexConn)
-		if !interrupt && lhsOk && rhsOk {
-			switch dir {
-			case dirUplink:
-				lhsDConn.CloseRead()
-				rhsDConn.CloseWrite()
-			case dirDownlink:
-				lhsDConn.CloseWrite()
-				rhsDConn.CloseRead()
-			default:
-				panic("unexpected direction")
-			}
-		} else {
-			lhs.Close()
-			rhs.Close()
-		}
+func (h *tcpHandler) relay(localConn, remoteConn net.Conn) {
+	var once sync.Once
+	closeOnce := func() {
+		once.Do(func() {
+			localConn.Close()
+			remoteConn.Close()
+		})
 	}
 
-	// Uplink
-	go func() {
-		var err error
-		_, err = io.Copy(rhs, lhs)
-		if err != nil {
-			cls(dirUplink, true) // interrupt the conn if the error is not nil (not EOF)
-		} else {
-			cls(dirUplink, false) // half close uplink direction of the TCP conn if possible
-		}
-		upCh <- struct{}{}
+	// Cleanup
+	defer func() {
+		// Close
+		closeOnce()
+		// Remove session
+		removeSession(localConn)
 	}()
 
-	// Downlink
-	var err error
-	_, err = io.Copy(lhs, rhs)
-	if err != nil {
-		cls(dirDownlink, true)
-	} else {
-		cls(dirDownlink, false)
-	}
+	// WaitGroup
+	var wg sync.WaitGroup
+	wg.Add(1)
 
-	<-upCh // Wait for uplink done.
+	// Up Link
+	go func() {
+		buf := pool.BufPool.Get().([]byte)
+		defer pool.BufPool.Put(buf[:cap(buf)])
+		if _, err := io.CopyBuffer(remoteConn, localConn, buf); err != nil {
+			closeOnce()
+		} else {
+			localConn.SetDeadline(time.Now())
+			remoteConn.SetDeadline(time.Now())
+			tcpCloseRead(remoteConn)
+		}
+		wg.Done()
+	}()
+
+	// Down Link
+	buf := pool.BufPool.Get().([]byte)
+	if _, err := io.CopyBuffer(localConn, remoteConn, buf); err != nil {
+		closeOnce()
+	} else {
+		localConn.SetDeadline(time.Now())
+		remoteConn.SetDeadline(time.Now())
+		tcpCloseRead(localConn)
+	}
+	pool.BufPool.Put(buf[:cap(buf)])
+
+	wg.Wait() // Wait for Up Link done
 }
 
 func (h *tcpHandler) Handle(conn net.Conn, target *net.TCPAddr) error {
-	dialer, err := proxy.SOCKS5("tcp", core.ParseTCPAddr(h.proxyHost, h.proxyPort).String(), nil, nil)
+	// Alias
+	var localConn = conn
+
+	// Lookup fakeDNS host record
+	targetHost, err := lookupHost(target)
 	if err != nil {
+		log.Warnf("lookup target host: %v", err)
 		return err
 	}
 
-	c, err := dialer.Dial(target.Network(), target.String())
+	proxyAddr := net.JoinHostPort(h.proxyHost, strconv.Itoa(h.proxyPort))
+	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(target.Port))
+	// Dial
+	remoteConn, err := dial(proxyAddr, targetAddr)
 	if err != nil {
+		log.Infof("Dial: %v", err)
 		return err
 	}
 
-	go h.relay(conn, c)
+	var process = "N/A"
+	if monitor != nil {
+		// Get name of the process
+		process = lsof.GetProcessName(localConn.LocalAddr())
+		session := &S.Session{
+			Process:       process,
+			Network:       localConn.LocalAddr().Network(),
+			DialerAddr:    remoteConn.LocalAddr().String(),
+			ClientAddr:    localConn.LocalAddr().String(),
+			TargetAddr:    targetAddr,
+			UploadBytes:   0,
+			DownloadBytes: 0,
+			SessionStart:  time.Now(),
+		}
+		addSession(localConn, session)
+		remoteConn = &S.Conn{Session: session, Conn: remoteConn}
+	}
 
-	log.Infof("new proxy connection to %v", target)
+	// Set keepalive
+	tcpKeepAlive(localConn)
+	tcpKeepAlive(remoteConn)
 
+	// Relay connections
+	go h.relay(localConn, remoteConn)
+
+	log.Access(process, "proxy", "tcp", localConn.LocalAddr().String(), targetAddr)
 	return nil
 }

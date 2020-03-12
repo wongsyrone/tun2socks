@@ -1,7 +1,9 @@
 package tun
 
 import (
+	"errors"
 	"io"
+	"net"
 
 	"github.com/songgao/water"
 )
@@ -17,5 +19,9 @@ func OpenTunDevice(name, addr, gw, mask string, dnsServers []string, persist boo
 		return nil, err
 	}
 	name = tunDev.Name()
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return nil, errors.New("invalid IP address")
+	}
 	return tunDev, nil
 }
